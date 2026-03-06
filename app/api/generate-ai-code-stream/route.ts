@@ -1356,6 +1356,19 @@ It's better to have 3 complete files than 10 incomplete files.`
           streamOptions.temperature = 0.7;
         }
         
+        // Limit thinking budget for Gemini 2.5 Flash to prevent timeouts
+        // Without this, the model can think for 30+ seconds before producing any output
+        if (isGoogle && actualModel.includes('flash')) {
+          streamOptions.providerOptions = {
+            google: {
+              thinkingConfig: {
+                thinkingBudget: 4096 // Limit thinking to speed up first-token time
+              }
+            }
+          };
+          console.log('[generate-ai-code-stream] Gemini Flash thinking budget limited to 4096 tokens');
+        }
+        
         // Add reasoning effort for GPT-5 models
         if (isOpenAI) {
           streamOptions.experimental_providerMetadata = {

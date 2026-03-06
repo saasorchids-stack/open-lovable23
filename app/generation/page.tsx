@@ -2975,9 +2975,17 @@ Focus on building something NEW, minimal, and functional that perfectly matches 
             }
           }
 
+          // Truncate scraped content to avoid bloating the prompt and causing timeouts
+          let scrapeContent = JSON.stringify(scrapeData, null, 2);
+          const MAX_SCRAPE_CHARS = 15000;
+          if (scrapeContent.length > MAX_SCRAPE_CHARS) {
+            console.log(`[clone] Truncating scraped content from ${scrapeContent.length} to ${MAX_SCRAPE_CHARS} chars`);
+            scrapeContent = scrapeContent.substring(0, MAX_SCRAPE_CHARS) + '\n... [content truncated for performance]';
+          }
+
           prompt = `I want to recreate the ${url} website as a complete React application based on the scraped content below.
 
-${JSON.stringify(scrapeData, null, 2)}
+${scrapeContent}
 
 ${filteredContext ? `ADDITIONAL CONTEXT/REQUIREMENTS FROM USER:
 ${filteredContext}
