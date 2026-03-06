@@ -1352,21 +1352,13 @@ It's better to have 3 complete files than 10 incomplete files.`
         };
         
         // Add temperature for non-reasoning models
-        if (!model.startsWith('openai/gpt-5')) {
+        // Skip temperature for Google thinking models (Gemini 2.5+) — Google API rejects it
+        const isGoogleThinkingModel = isGoogle && (actualModel.includes('2.5') || actualModel.includes('3-'));
+        if (!model.startsWith('openai/gpt-5') && !isGoogleThinkingModel) {
           streamOptions.temperature = 0.7;
         }
-        
-        // Limit thinking budget for Gemini 2.5 Flash to prevent timeouts
-        // Without this, the model can think for 30+ seconds before producing any output
-        if (isGoogle && actualModel.includes('flash')) {
-          streamOptions.providerOptions = {
-            google: {
-              thinkingConfig: {
-                thinkingBudget: 4096 // Limit thinking to speed up first-token time
-              }
-            }
-          };
-          console.log('[generate-ai-code-stream] Gemini Flash thinking budget limited to 4096 tokens');
+        if (isGoogleThinkingModel) {
+          console.log('[generate-ai-code-stream] Skipping temperature for Google thinking model:', actualModel);
         }
         
         // Add reasoning effort for GPT-5 models
@@ -1884,17 +1876,32 @@ Provide the complete file content without any truncation. Include all necessary 
           }
         }
         
-        // Send completion with packages info
-        await sendProgress({ 
-          type: 'complete', 
-          generatedCode,
-          explanation,
-          files: files.length,
-          components: componentCount,
-          model,
-          packagesToInstall: packagesToInstall.length > 0 ? packagesToInstall : undefined,
-          warnings: truncationWarnings.length > 0 ? truncationWarnings : undefined
-        });
+        // Log stream completion stats
+        const streamDurationMs = Date.now() - functionStartTime;
+        console.log(`[generate-ai-code-stream] Stream completed in ${streamDurationMs}ms, code length: ${generatedCode.length}, files: ${files.length}`);
+        
+        // Guard: if generatedCode is empty, send an error instead of an empty complete
+        if (!generatedCode || !generatedCode.includes('<file path=')) {
+          console.error('[generate-ai-code-stream] Stream produced no usable code!');
+          console.error('[generate-ai-code-stream] generatedCode length:', generatedCode.length);
+          console.error('[generate-ai-code-stream] generatedCode preview:', generatedCode.substring(0, 500));
+          await sendProgress({
+            type: 'error',
+            error: `AI model produced no code (${streamDurationMs}ms elapsed). The model may have failed silently. Please try again.`
+          });
+        } else {
+          // Send completion with packages info
+          await sendProgress({ 
+            type: 'complete', 
+            generatedCode,
+            explanation,
+            files: files.length,
+            components: componentCount,
+            model,
+            packagesToInstall: packagesToInstall.length > 0 ? packagesToInstall : undefined,
+            warnings: truncationWarnings.length > 0 ? truncationWarnings : undefined
+          });
+        }
         
         // Track edit in conversation history
         if (isEdit && editContext && global.conversationState) {
