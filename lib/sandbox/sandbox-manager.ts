@@ -44,7 +44,23 @@ class SandboxManager {
         }
       }
       
-      // For Vercel or if reconnection failed, return the new provider
+      // For Vercel provider, try to reconnect
+      if (provider.constructor.name === 'VercelProvider') {
+        const reconnected = await (provider as any).reconnect(sandboxId);
+        if (reconnected) {
+          this.sandboxes.set(sandboxId, {
+            sandboxId,
+            provider,
+            createdAt: new Date(),
+            lastAccessed: new Date()
+          });
+          this.activeSandboxId = sandboxId;
+          console.log(`[SandboxManager] Successfully reconnected to Vercel sandbox ${sandboxId}`);
+          return provider;
+        }
+      }
+      
+      // If reconnection failed, return the new provider
       // The caller will need to handle creating a new sandbox
       return provider;
     } catch (error) {

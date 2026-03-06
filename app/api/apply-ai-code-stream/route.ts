@@ -303,11 +303,15 @@ export async function POST(request: NextRequest) {
     }
 
     // Try to get provider from sandbox manager first
+    console.log(`[apply-ai-code-stream] Looking for provider, sandboxId: ${sandboxId || 'NONE'}`);
     let provider = sandboxId ? sandboxManager.getProvider(sandboxId) : sandboxManager.getActiveProvider();
+    console.log(`[apply-ai-code-stream] Provider from manager: ${provider ? 'found' : 'not found'}`);
 
     // Fall back to global state if not found in manager
     if (!provider) {
       provider = global.activeSandboxProvider;
+      console.log(`[apply-ai-code-stream] Provider from global: ${provider ? 'found' : 'not found'}`);
+    }
     }
 
     // If we have a sandboxId but no provider, try to get or create one

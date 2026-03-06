@@ -14,6 +14,10 @@ import { appConfig } from '@/config/app.config';
 // Force dynamic route to enable streaming
 export const dynamic = 'force-dynamic';
 
+// Maximum function duration (Vercel Hobby = 60s, Pro = 300s)
+// This tells Vercel to allow longer execution for streaming
+export const maxDuration = 60;
+
 // Check if we're using Vercel AI Gateway
 const isUsingAIGateway = !!process.env.AI_GATEWAY_API_KEY;
 const aiGatewayBaseURL = 'https://ai-gateway.vercel.sh/v1';
@@ -171,6 +175,25 @@ export async function POST(request: NextRequest) {
         console.error('[generate-ai-code-stream] Error writing to stream:', error);
       }
     };
+    
+    // Safety timeout: send an error event before Vercel kills the function
+    // Vercel Hobby = 60s, so we abort at 55s to have time to send the error
+    const SAFETY_TIMEOUT_MS = 55000;
+    const functionStartTime = Date.now();
+    let safetyTimedOut = false;
+    const safetyTimeout = setTimeout(async () => {
+      safetyTimedOut = true;
+      console.error('[generate-ai-code-stream] SAFETY TIMEOUT: Function approaching Vercel limit');
+      try {
+        await sendProgress({ 
+          type: 'error', 
+          error: 'Generation timed out (55s). The AI model took too long. Try using Gemini 2.5 Flash for faster results.'
+        });
+        await writer.close();
+      } catch (e) {
+        console.error('[generate-ai-code-stream] Error sending timeout event:', e);
+      }
+    }, SAFETY_TIMEOUT_MS);
     
     // Start processing in background
     (async () => {
@@ -1305,7 +1328,7 @@ If you're running out of space, generate FEWER files but make them COMPLETE.
 It's better to have 3 complete files than 10 incomplete files.`
             }
           ],
-          maxTokens: 8192, // Reduce to ensure completion
+          maxTokens: 65536, // Generous limit for complete code generation
           stopSequences: [] // Don't stop early
           // Note: Neither Groq nor Anthropic models support tool/function calling in this context
           // We use XML tags for package detection instead
@@ -1393,6 +1416,20 @@ It's better to have 3 complete files than 10 incomplete files.`
         // Buffer for incomplete tags
         let tagBuffer = '';
         
+        // Start keepalive interval to prevent Vercel from killing the function
+        // during long AI thinking phases (Gemini, GPT-5, etc.)
+        let keepaliveActive = true;
+        const keepaliveInterval = setInterval(async () => {
+          if (!keepaliveActive) return;
+          try {
+            await writer.write(encoder.encode(': keepalive\n\n'));
+          } catch (e) {
+            // Stream closed, stop sending
+            keepaliveActive = false;
+          }
+        }, 5000); // Every 5 seconds
+        
+        try {
         // Stream the response and parse for packages in real-time
         for await (const textPart of result?.textStream || []) {
           const text = textPart || '';
@@ -1501,6 +1538,12 @@ It's better to have 3 complete files than 10 incomplete files.`
             currentFile = '';
             currentFilePath = '';
           }
+        }
+        
+        } finally {
+          // Stop keepalive interval once streaming is done
+          keepaliveActive = false;
+          clearInterval(keepaliveInterval);
         }
         
         console.log('\n\n[generate-ai-code-stream] Streaming complete.');
@@ -1852,6 +1895,12 @@ Provide the complete file content without any truncation. Include all necessary 
       } catch (error) {
         console.error('[generate-ai-code-stream] Stream processing error:', error);
         
+        // Don't send error if safety timeout already fired
+        if (safetyTimedOut) {
+          console.error('[generate-ai-code-stream] Skipping error send - safety timeout already fired');
+          return;
+        }
+        
         // Check if it's a tool validation error
         if ((error as any).message?.includes('tool call validation failed')) {
           console.error('[generate-ai-code-stream] Tool call validation error - this may be due to the AI model sending incorrect parameters');
@@ -1867,7 +1916,10 @@ Provide the complete file content without any truncation. Include all necessary 
           });
         }
       } finally {
-        await writer.close();
+        clearTimeout(safetyTimeout);
+        if (!safetyTimedOut) {
+          await writer.close();
+        }
       }
     })();
     

@@ -54,6 +54,7 @@ interface ScrapeData {
   title?: string;
   source?: string;
   screenshot?: string;
+  htmlStructure?: string;
   structured?: any;
   metadata?: any;
   message?: string;
@@ -126,6 +127,13 @@ function AISandboxPage() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const chatMessagesRef = useRef<HTMLDivElement>(null);
   const codeDisplayRef = useRef<HTMLDivElement>(null);
+  const sandboxDataRef = useRef<any>(null);
+  const [sandboxExpired, setSandboxExpired] = useState(false);
+  
+  // Keep sandboxDataRef always in sync with state (avoids stale closures)
+  useEffect(() => {
+    sandboxDataRef.current = sandboxData;
+  }, [sandboxData]);
   
   const [codeApplicationState, setCodeApplicationState] = useState<CodeApplicationState>({
     stage: null
@@ -240,9 +248,6 @@ function AISandboxPage() {
         
         // Set flag to auto-trigger generation after component updates
         setShouldAutoGenerate(true);
-        
-        // Also set autoStart flag for the effect
-        sessionStorage.setItem('autoStart', 'true');
       }
       
       // Clear old conversation
@@ -279,12 +284,7 @@ function AISandboxPage() {
           await createSandbox(true);
         }
         
-        // If we have a URL from the home page, mark for automatic start
-        if (storedUrl && isMounted) {
-          // We'll trigger the generation after the component is fully mounted
-          // and the startGeneration function is defined
-          sessionStorage.setItem('autoStart', 'true');
-        }
+        // Generation is triggered by shouldAutoGenerate state flag
       } catch (error) {
         console.error('[ai-sandbox] Failed to create or restore sandbox:', error);
         if (isMounted) {
@@ -334,23 +334,9 @@ function AISandboxPage() {
 
   // Auto-start generation if flagged
   useEffect(() => {
-    const autoStart = sessionStorage.getItem('autoStart');
-    if (autoStart === 'true' && !showHomeScreen && homeUrlInput) {
-      sessionStorage.removeItem('autoStart');
-      // Small delay to ensure everything is ready
-      setTimeout(() => {
-        console.log('[generation] Auto-starting generation for URL:', homeUrlInput);
-        startGeneration();
-      }, 1000);
-    }
-  }, [showHomeScreen, homeUrlInput]); // eslint-disable-line react-hooks/exhaustive-deps
-
-
-  useEffect(() => {
     // Only check sandbox status on mount if we don't already have sandboxData
     // AND we're not auto-starting a new generation (which would create a new sandbox)
-    const autoStart = sessionStorage.getItem('autoStart');
-    if (!sandboxData && autoStart !== 'true') {
+    if (!sandboxData && !shouldAutoGenerate) {
       checkSandboxStatus();
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -362,21 +348,18 @@ function AISandboxPage() {
   }, [chatMessages]);
 
   // Auto-trigger generation when flag is set (from home page navigation)
+  // Wait for BOTH shouldAutoGenerate AND sandboxData to be ready
   useEffect(() => {
-    if (shouldAutoGenerate && homeUrlInput && !showHomeScreen) {
+    if (shouldAutoGenerate && homeUrlInput && !showHomeScreen && sandboxData) {
       // Reset the flag
       setShouldAutoGenerate(false);
       
-      // Trigger generation after a short delay to ensure everything is set up
-      const timer = setTimeout(() => {
-        console.log('[generation] Auto-triggering generation from URL params');
-        startGeneration();
-      }, 1000);
-      
-      return () => clearTimeout(timer);
+      // Trigger generation immediately - sandbox is ready
+      console.log('[generation] Auto-triggering generation from URL params, sandbox ready:', sandboxData.sandboxId);
+      startGeneration();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shouldAutoGenerate, homeUrlInput, showHomeScreen]);
+  }, [shouldAutoGenerate, homeUrlInput, showHomeScreen, sandboxData]);
 
   const updateStatus = (text: string, active: boolean) => {
     setStatus({ text, active });
@@ -440,13 +423,16 @@ function AISandboxPage() {
       
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
+      let sseBuffer = '';
       
       while (reader) {
         const { done, value } = await reader.read();
         if (done) break;
         
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        const chunk = decoder.decode(value, { stream: true });
+        sseBuffer += chunk;
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() || '';
         
         for (const line of lines) {
           if (line.startsWith('data: ')) {
@@ -558,6 +544,7 @@ function AISandboxPage() {
         sandboxCreationRef.current = false; // Reset the ref on success
         console.log('[createSandbox] Setting sandboxData from creation:', data);
         setSandboxData(data);
+        sandboxDataRef.current = data; // Keep ref in sync for closures
         updateStatus('Sandbox active', true);
         log('Sandbox created successfully!');
         log(`Sandbox ID: ${data.sandboxId}`);
@@ -641,7 +628,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       }
       
       // Use streaming endpoint for real-time feedback
-      const effectiveSandboxData = overrideSandboxData || sandboxData;
+      const effectiveSandboxData = overrideSandboxData || sandboxDataRef.current || sandboxData;
       const response = await fetch('/api/apply-ai-code-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -661,13 +648,16 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       const reader = response.body?.getReader();
       const decoder = new TextDecoder();
       let finalData: any = null;
+      let sseBuffer = '';
       
       while (reader) {
         const { done, value } = await reader.read();
         if (done) break;
         
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
+        const chunk = decoder.decode(value, { stream: true });
+        sseBuffer += chunk;
+        const lines = sseBuffer.split('\n');
+        sseBuffer = lines.pop() || '';
         
         for (const line of lines) {
           if (line.startsWith('data: ')) {
@@ -941,110 +931,33 @@ Tip: I automatically detect and install npm packages from your code imports (lik
           // but that's only available in the backend API routes
           console.log('[build-test] Skipping build test - would need API endpoint');
           
-          // Force iframe refresh after applying code
-          const refreshDelay = appConfig.codeApplication.defaultRefreshDelay; // Allow Vite to process changes
-          
-          setTimeout(() => {
-            const currentSandboxData = effectiveSandboxData;
-            if (iframeRef.current && currentSandboxData?.url) {
-              console.log('[home] Refreshing iframe after code application...');
-              
-              // Method 1: Change src with timestamp
-              const urlWithTimestamp = `${currentSandboxData.url}?t=${Date.now()}&applied=true`;
-              iframeRef.current.src = urlWithTimestamp;
-              
-              // Method 2: Force reload after a short delay
-              setTimeout(() => {
-                try {
-                  if (iframeRef.current?.contentWindow) {
-                    iframeRef.current.contentWindow.location.reload();
-                    console.log('[home] Force reloaded iframe content');
-                  }
-                } catch (e) {
-                  console.log('[home] Could not reload iframe (cross-origin):', e);
-                }
-                // Reload completed
-              }, 1000);
-            }
-          }, refreshDelay);
-          
           // Vite error checking removed - handled by template setup
         }
         
-          // Give Vite HMR a moment to detect changes, then ensure refresh
+        // Single unified iframe refresh after code application
+        {
           const currentSandboxData = effectiveSandboxData;
-          if (iframeRef.current && currentSandboxData?.url) {
-            // Wait for Vite to process the file changes
-            // If packages were installed, wait longer for Vite to restart
-            const packagesInstalled = results?.packagesInstalled?.length > 0 || data.results?.packagesInstalled?.length > 0;
-            const refreshDelay = packagesInstalled ? appConfig.codeApplication.packageInstallRefreshDelay : appConfig.codeApplication.defaultRefreshDelay;
-            console.log(`[applyGeneratedCode] Packages installed: ${packagesInstalled}, refresh delay: ${refreshDelay}ms`);
-            
-            setTimeout(async () => {
+          const packagesInstalled = results?.packagesInstalled?.length > 0 || data.results?.packagesInstalled?.length > 0;
+          const refreshDelay = packagesInstalled ? appConfig.codeApplication.packageInstallRefreshDelay : appConfig.codeApplication.defaultRefreshDelay;
+          
+          // The iframe may not be mounted yet (React state update from createSandbox is async).
+          // Use a retry loop to wait for the iframe to appear in the DOM.
+          const attemptRefresh = (retriesLeft: number) => {
             if (iframeRef.current && currentSandboxData?.url) {
-              console.log('[applyGeneratedCode] Starting iframe refresh sequence...');
-              console.log('[applyGeneratedCode] Current iframe src:', iframeRef.current.src);
-              console.log('[applyGeneratedCode] Sandbox URL:', currentSandboxData.url);
-              
-              // Method 1: Try direct navigation first
-              try {
-                const urlWithTimestamp = `${currentSandboxData.url}?t=${Date.now()}&force=true`;
-                console.log('[applyGeneratedCode] Attempting direct navigation to:', urlWithTimestamp);
-                
-                // Remove any existing onload handler
-                iframeRef.current.onload = null;
-                
-                // Navigate directly
-                iframeRef.current.src = urlWithTimestamp;
-                
-                // Wait a bit and check if it loaded
-                await new Promise(resolve => setTimeout(resolve, 2000));
-                
-                // Try to access the iframe content to verify it loaded
-                try {
-                  const iframeDoc = iframeRef.current.contentDocument || iframeRef.current.contentWindow?.document;
-                  if (iframeDoc && iframeDoc.readyState === 'complete') {
-                    console.log('[applyGeneratedCode] Iframe loaded successfully');
-                    return;
-                  }
-                } catch {
-                  console.log('[applyGeneratedCode] Cannot access iframe content (CORS), assuming loaded');
-                  return;
-                }
-              } catch (e) {
-                console.error('[applyGeneratedCode] Direct navigation failed:', e);
-              }
-              
-              // Method 2: Force complete iframe recreation if direct navigation failed
-              console.log('[applyGeneratedCode] Falling back to iframe recreation...');
-              const parent = iframeRef.current.parentElement;
-              const newIframe = document.createElement('iframe');
-              
-              // Copy attributes
-              newIframe.className = iframeRef.current.className;
-              newIframe.title = iframeRef.current.title;
-              newIframe.allow = iframeRef.current.allow;
-              // Copy sandbox attributes
-              const sandboxValue = iframeRef.current.getAttribute('sandbox');
-              if (sandboxValue) {
-                newIframe.setAttribute('sandbox', sandboxValue);
-              }
-              
-              // Remove old iframe
-              iframeRef.current.remove();
-              
-              // Add new iframe
-              newIframe.src = `${currentSandboxData.url}?t=${Date.now()}&recreated=true`;
-              parent?.appendChild(newIframe);
-              
-              // Update ref
-              (iframeRef as any).current = newIframe;
-              
-              console.log('[applyGeneratedCode] Iframe recreated with new content');
+              console.log('[applyGeneratedCode] Refreshing iframe after code application...');
+              const urlWithTimestamp = `${currentSandboxData.url}?t=${Date.now()}&applied=true`;
+              iframeRef.current.src = urlWithTimestamp;
+              console.log('[applyGeneratedCode] Refreshed iframe via src reassignment');
+            } else if (retriesLeft > 0) {
+              console.log(`[applyGeneratedCode] iframe not ready yet, retrying in 500ms (${retriesLeft} retries left)...`);
+              setTimeout(() => attemptRefresh(retriesLeft - 1), 500);
             } else {
-              console.error('[applyGeneratedCode] No iframe or sandbox URL available for refresh');
+              console.warn('[applyGeneratedCode] iframe never became available after retries — code was applied server-side, preview will load when iframe mounts');
             }
-          }, refreshDelay); // Dynamic delay based on whether packages were installed
+          };
+          
+          console.log(`[applyGeneratedCode] Scheduling iframe refresh. Packages installed: ${packagesInstalled}, delay: ${refreshDelay}ms`);
+          setTimeout(() => attemptRefresh(10), refreshDelay); // up to 10 retries = 5s of waiting
         }
         
         } else {
@@ -1067,10 +980,10 @@ Tip: I automatically detect and install npm packages from your code imports (lik
   };
 
   const fetchSandboxFiles = async () => {
-    if (!sandboxData) return;
+    if (!sandboxData?.sandboxId) return;
     
     try {
-      const response = await fetch('/api/get-sandbox-files', {
+      const response = await fetch(`/api/get-sandbox-files?sandboxId=${encodeURIComponent(sandboxData.sandboxId)}`, {
         method: 'GET',
         headers: {
           'Content-Type': 'application/json',
@@ -1343,8 +1256,8 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                   </div>
                 ) : /* If no files parsed yet, show loading or raw stream */
                 generationProgress.files.length === 0 && !generationProgress.currentFile ? (
-                  generationProgress.isThinking ? (
-                    // Beautiful loading state while thinking
+                  generationProgress.isThinking || (!generationProgress.streamedCode && generationProgress.isStreaming) ? (
+                    // Beautiful loading state while AI is thinking / waiting for first token
                     <div className="flex items-center justify-center h-full">
                       <div className="text-center">
                         <div className="mb-8 relative">
@@ -1353,8 +1266,9 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                             <div className="absolute inset-0 border-8 border-green-500 rounded-full animate-spin border-t-transparent"></div>
                           </div>
                         </div>
-                        <h3 className="text-xl font-medium text-white mb-2">AI is analyzing your request</h3>
-                        <p className="text-gray-400 text-sm">{generationProgress.status || 'Preparing to generate code...'}</p>
+                        <h3 className="text-xl font-medium text-white mb-2">AI is generating your code</h3>
+                        <p className="text-gray-400 text-sm">{generationProgress.status || 'Waiting for AI model to respond...'}</p>
+                        <p className="text-gray-500 text-xs mt-2">This can take 1-3 minutes for complex websites</p>
                       </div>
                     </div>
                   ) : (
@@ -1594,6 +1508,38 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       if (sandboxData?.url) {
         return (
           <div className="relative w-full h-full">
+            {sandboxExpired ? (
+              <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center backdrop-blur-sm z-20">
+                <div className="text-center max-w-md p-6">
+                  <div className="text-4xl mb-4">⏰</div>
+                  <h3 className="text-white text-xl font-semibold mb-2">Sandbox Expired</h3>
+                  <p className="text-white/70 text-sm mb-6">
+                    The sandbox has timed out. You can recreate it and re-apply your last generated code.
+                  </p>
+                  <button
+                    onClick={async () => {
+                      setSandboxExpired(false);
+                      addChatMessage('Recreating sandbox...', 'system');
+                      try {
+                        const newSandbox = await createSandbox(true);
+                        if (newSandbox && conversationContext.lastGeneratedCode) {
+                          addChatMessage('Re-applying last generated code...', 'system');
+                          await applyGeneratedCode(conversationContext.lastGeneratedCode, false, newSandbox);
+                          addChatMessage('Sandbox restored successfully!', 'system');
+                        } else if (newSandbox) {
+                          addChatMessage('Sandbox recreated. You can continue editing.', 'system');
+                        }
+                      } catch (err: any) {
+                        addChatMessage(`Failed to recreate sandbox: ${err.message}`, 'system');
+                      }
+                    }}
+                    className="px-6 py-3 bg-white text-black font-medium rounded-lg hover:bg-white/90 transition-colors"
+                  >
+                    Recreate Sandbox
+                  </button>
+                </div>
+              </div>
+            ) : null}
             <iframe
               ref={iframeRef}
               src={sandboxData.url}
@@ -1744,7 +1690,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     let sandboxPromise: Promise<void> | null = null;
     let sandboxCreating = false;
     
-    if (!sandboxData) {
+    if (!sandboxDataRef.current && !sandboxData) {
       sandboxCreating = true;
       addChatMessage('Creating sandbox while I plan your app...', 'system');
       sandboxPromise = createSandbox(true).catch((error: any) => {
@@ -1780,13 +1726,28 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       // Backend now manages file state - no need to fetch from frontend
       console.log('[chat] Using backend file cache for context');
       
+      // Sanitize conversationContext to avoid payload size issues (Vercel 4.5MB limit)
+      const sanitizedChatContext = {
+        ...conversationContext,
+        scrapedWebsites: conversationContext.scrapedWebsites.map(site => ({
+          url: site.url,
+          timestamp: site.timestamp,
+          content: typeof site.content === 'string'
+            ? site.content.substring(0, 2000)
+            : JSON.stringify(site.content).substring(0, 2000)
+        })),
+        lastGeneratedCode: conversationContext.lastGeneratedCode
+          ? conversationContext.lastGeneratedCode.substring(0, 50000)
+          : undefined
+      };
+
       const fullContext = {
-        sandboxId: sandboxData?.sandboxId || (sandboxCreating ? 'pending' : null),
+        sandboxId: sandboxDataRef.current?.sandboxId || sandboxData?.sandboxId || (sandboxCreating ? 'pending' : null),
         structure: structureContent,
         recentMessages: chatMessages.slice(-20),
-        conversationContext: conversationContext,
+        conversationContext: sanitizedChatContext,
         currentCode: promptInput,
-        sandboxUrl: sandboxData?.url,
+        sandboxUrl: sandboxDataRef.current?.url || sandboxData?.url,
         sandboxCreating: sandboxCreating
       };
       
@@ -1795,9 +1756,17 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       console.log('[chat] - sandboxId:', fullContext.sandboxId);
       console.log('[chat] - isEdit:', conversationContext.appliedCode.length > 0);
       
+      // AbortController with overall timeout and stall detection
+      const chatAbortController = new AbortController();
+      const chatOverallTimeout = setTimeout(() => {
+        chatAbortController.abort();
+        console.error('[chat] Generation timed out after 600s');
+      }, 600000); // 10 min - Gemini thinking can take minutes
+      
       const response = await fetch('/api/generate-ai-code-stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: chatAbortController.signal,
         body: JSON.stringify({
           prompt: message,
           model: aiModel,
@@ -1807,6 +1776,7 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       });
       
       if (!response.ok) {
+        clearTimeout(chatOverallTimeout);
         throw new Error(`HTTP error! status: ${response.status}`);
       }
       
@@ -1815,11 +1785,23 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       let generatedCode = '';
       let explanation = '';
       let buffer = ''; // Buffer for incomplete lines
+      let streamError: string | null = null;
+      // Stall detector: abort if no data received for 120s
+      let chatStallTimer = setTimeout(() => {
+        console.error('[chat] Stream stalled - no data for 120s');
+        chatAbortController.abort();
+      }, 120000);
       
       if (reader) {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
+          // Reset stall timer on each chunk
+          clearTimeout(chatStallTimer);
+          chatStallTimer = setTimeout(() => {
+            console.error('[chat] Stream stalled - no data for 120s');
+            chatAbortController.abort();
+          }, 120000);
           
           const chunk = decoder.decode(value, { stream: true });
           console.log('[chat] Received chunk:', chunk.length, 'bytes');
@@ -1863,6 +1845,9 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                     addChatMessage(text.trim(), 'ai');
                   }
                 } else if (data.type === 'stream' && data.raw) {
+                  // Accumulate raw stream text into local generatedCode
+                  generatedCode += data.text || '';
+                  
                   setGenerationProgress(prev => {
                     const newStreamedCode = prev.streamedCode + data.text;
                     
@@ -2036,14 +2021,59 @@ Tip: I automatically detect and install npm packages from your code imports (lik
                     files: prev.files.length > 0 ? prev.files : parsedFiles
                   }));
                 } else if (data.type === 'error') {
-                  throw new Error(data.error);
+                  streamError = data.error || data.message || 'Unknown generation error';
                 }
               } catch (e) {
+                if (!(e instanceof SyntaxError)) throw e;
                 console.error('Failed to parse SSE data:', e);
               }
             }
           }
         }
+      }
+      
+      // Flush any remaining data in buffer
+      if (buffer.trim()) {
+        console.log('[chat] Flushing remaining buffer:', buffer.slice(0, 200));
+        const remainingLines = buffer.split('\n');
+        for (const line of remainingLines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (data.type === 'error') {
+                streamError = data.error || data.message || 'Unknown generation error';
+              } else if (data.type === 'stream' && data.raw) {
+                generatedCode += data.text || '';
+              } else if (data.type === 'complete' && data.generatedCode) {
+                generatedCode = data.generatedCode;
+              }
+            } catch (e) {
+              if (!(e instanceof SyntaxError)) throw e;
+            }
+          }
+        }
+      }
+      
+      // Clean up timers
+      clearTimeout(chatStallTimer);
+      clearTimeout(chatOverallTimeout);
+      
+      // Throw collected stream error after loop ends
+      if (streamError) {
+        throw new Error(streamError);
+      }
+      
+      // Detect premature stream end: if we got no code and no error, the stream died
+      if (!generatedCode || !generatedCode.includes('<file path=')) {
+        if (!streamError) {
+          console.error('[chat] Stream ended without generating usable code. generatedCode length:', generatedCode.length);
+          throw new Error('AI generation produced no usable code. The AI model may have timed out or failed to respond. Please try again.');
+        }
+      }
+      
+      // If we only have code from stream events (no complete event), log it
+      if (generatedCode && generatedCode.includes('<file path=') && !explanation) {
+        console.log('[chat] No complete event received, using code accumulated from stream events (' + generatedCode.length + ' chars)');
       }
       
       if (generatedCode) {
@@ -2162,7 +2192,8 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     try {
       const response = await fetch('/api/create-zip', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' }
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sandboxId: sandboxData?.sandboxId })
       });
       
       const data = await response.json();
@@ -2631,8 +2662,15 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     await startGeneration();
   };
 
+  const generationInProgress = useRef(false);
   const startGeneration = async () => {
     if (!homeUrlInput.trim()) return;
+    // Prevent double calls from multiple triggers
+    if (generationInProgress.current) {
+      console.log('[generation] Generation already in progress, skipping duplicate call');
+      return;
+    }
+    generationInProgress.current = true;
     
     setHomeScreenFading(true);
     
@@ -2666,7 +2704,9 @@ Tip: I automatically detect and install npm packages from your code imports (lik
     );
     
     // Start creating sandbox and capturing screenshot immediately in parallel
-    const sandboxPromise = !sandboxData ? createSandbox(true) : Promise.resolve(null);
+    // Use ref to get latest sandboxData (avoids stale closure issue)
+    const currentSandboxData = sandboxDataRef.current;
+    const sandboxPromise = !currentSandboxData ? createSandbox(true) : Promise.resolve(null);
     
     // Set loading stage immediately before hiding home screen
     setLoadingStage('gathering');
@@ -2688,6 +2728,14 @@ Tip: I automatically detect and install npm packages from your code imports (lik
       
       // Wait for sandbox to be ready (if it's still creating)
       const createdSandbox = await sandboxPromise;
+      
+      // Get the latest sandboxData from ref (avoids stale closure)
+      const activeSandboxData = sandboxDataRef.current;
+      if (!activeSandboxData) {
+        console.error('[clone] No sandbox data available after sandbox creation');
+        throw new Error('Sandbox creation failed - no sandbox data available. Please try again.');
+      }
+      console.log('[clone] Using sandbox:', activeSandboxData.sandboxId);
       
       // Now start the clone process which will stream the generation
       setUrlInput(homeUrlInput);
@@ -2975,27 +3023,52 @@ Focus on building something NEW, minimal, and functional that perfectly matches 
             }
           }
 
-          prompt = `I want to recreate the ${url} website as a complete React application based on the scraped content below.
+          // Extract only the useful content from scrape data, avoiding duplication  
+          // and massive payloads that can exceed Vercel's 4.5MB request body limit
+          const scrapeContent = scrapeData.content || scrapeData.structured?.content || '';
+          const scrapeTitle = scrapeData.structured?.title || scrapeData.title || '';
+          const scrapeDescription = scrapeData.structured?.description || '';
+          const scrapeHtmlStructure = scrapeData.htmlStructure || scrapeData.structured?.htmlStructure || '';
+          
+          // Truncate content if too large (keep under ~100K chars to fit in prompt)
+          const MAX_CONTENT_LENGTH = 100000;
+          const truncatedContent = scrapeContent.length > MAX_CONTENT_LENGTH
+            ? scrapeContent.substring(0, MAX_CONTENT_LENGTH) + '\n\n[Content truncated - focus on recreating the visible sections above]'
+            : scrapeContent;
+          
+          const hasScreenshot = !!(scrapeData?.screenshot || scrapeData?.structured?.screenshot);
+          
+          prompt = `Generate a COMPLETE React + Tailwind CSS web application that looks EXACTLY like ${url}.
+${hasScreenshot ? '\nA full-page screenshot of the original website is attached. Your #1 goal: make the app IDENTICAL to this screenshot.' : ''}
 
-${JSON.stringify(scrapeData, null, 2)}
+## Source Website
+- Title: ${scrapeTitle}
+- Description: ${scrapeDescription}  
+- URL: ${url}
 
-${filteredContext ? `ADDITIONAL CONTEXT/REQUIREMENTS FROM USER:
+${scrapeHtmlStructure ? `## Page Structure (from HTML analysis)
+\`\`\`
+${scrapeHtmlStructure}
+\`\`\`
+` : ''}
+## Website Content (use this EXACT text — do NOT make up content)
+${truncatedContent}
+
+${filteredContext ? `## Additional Requirements
 ${filteredContext}
+` : ''}
+## CRITICAL Replication Instructions
 
-Please incorporate these requirements into the design and implementation.` : ''}
+1. VISUAL FIDELITY: Match the ${hasScreenshot ? 'screenshot' : 'original website'} pixel-for-pixel — background colors, text colors, font sizes, font families, padding, margin, border, border-radius, gradients, shadows.
+2. FULL PAGE: Reproduce EVERY section from top to bottom. Count sections in the content above — create a component for EACH one. Aim for 8-12 separate component files minimum.
+3. EXACT TEXT: Use the exact text from the scraped content above — NEVER use placeholder text or lorem ipsum.
+4. TYPOGRAPHY: Import Google Fonts via @import in index.css if the site uses custom fonts. Match font weights and sizes.
+5. LAYOUT: Study the layout carefully — flex direction, gaps, alignment, grid structure. Match them exactly.
+6. INTERACTIVITY: cursor-pointer on ALL clickable elements, transition-colors duration-200 on ALL hover states.
+7. IMAGES: Use https://placehold.co/{width}x{height} or https://images.unsplash.com for placeholder images.
+8. COMPLETENESS: Every <file> must have a matching </file> with COMPLETE code. Never truncate.
 
-IMPORTANT INSTRUCTIONS:
-- Create a COMPLETE, working React application
-- Implement ALL sections and features from the original site
-- Use Tailwind CSS for all styling (no custom CSS files)
-- Make it responsive and modern
-- Ensure all text content matches the original
-- Create proper component structure
-- Make sure the app actually renders visible content
-- Create ALL components that you reference in imports
-${filteredContext ? '- Apply the user\'s context/theme requirements throughout the application' : ''}
-
-Focus on the key sections and content, making it clean and modern.`;
+Generate ALL files now. Do NOT stop early.`;
         }
 
         setGenerationProgress(prev => ({
@@ -3014,44 +3087,96 @@ Focus on the key sections and content, making it clean and modern.`;
           lastProcessedPosition: 0
         }));
         
+        // AbortController with overall timeout and stall detection
+        const abortController = new AbortController();
+        const overallTimeout = setTimeout(() => {
+          abortController.abort();
+          console.error('[clone] Generation timed out after 600s');
+        }, 600000); // 10 min - Gemini 2.5 Flash thinking can take 2-5 min
+        
+        // Sanitize conversationContext to avoid payload size issues (Vercel 4.5MB limit)
+        const sanitizedContext = {
+          ...conversationContext,
+          scrapedWebsites: conversationContext.scrapedWebsites.map(site => ({
+            url: site.url,
+            timestamp: site.timestamp,
+            content: typeof site.content === 'string'
+              ? site.content.substring(0, 2000)
+              : JSON.stringify(site.content).substring(0, 2000)
+          })),
+          lastGeneratedCode: undefined // Server has its own file cache
+        };
+
         const aiResponse = await fetch('/api/generate-ai-code-stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: abortController.signal,
           body: JSON.stringify({ 
             prompt,
             model: aiModel,
+            screenshotUrl: scrapeData?.screenshot || scrapeData?.structured?.screenshot || null,
             context: {
-              sandboxId: sandboxData?.sandboxId,
+              sandboxId: activeSandboxData?.sandboxId,
               structure: structureContent,
-              conversationContext: conversationContext
+              conversationContext: sanitizedContext
             }
           })
         });
         
         if (!aiResponse.ok || !aiResponse.body) {
-          throw new Error('Failed to generate code');
+          clearTimeout(overallTimeout);
+          let errText = `HTTP ${aiResponse.status}`;
+          try {
+            const errBody = await aiResponse.text();
+            const errJson = JSON.parse(errBody);
+            errText = errJson.error || errJson.message || errText;
+          } catch (e) {
+            // Failed to parse error body
+          }
+          if (aiResponse.status === 413) {
+            errText = 'Request payload too large. The scraped website content exceeds size limits. Try a simpler URL.';
+          }
+          throw new Error(`Failed to generate code: ${errText}`);
         }
         
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let generatedCode = '';
         let explanation = '';
-        let sseBuffer = ''; // Buffer for incomplete SSE lines
-        let streamedCodeAccumulator = ''; // Track code from stream events as fallback
+        let sseBuffer = ''; // Buffer for incomplete SSE lines across chunks
+        let streamError: Error | null = null;
+        // Stall detector: abort if no data received for 120s
+        // (Gemini 2.5 Flash thinking phase can block textStream for 60-120s)
+        let stallTimer = setTimeout(() => {
+          console.error('[clone] Stream stalled - no data for 120s');
+          abortController.abort();
+        }, 120000);
+        
+        let totalChunks = 0;
+        let totalBytes = 0;
         
         while (true) {
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            console.log(`[clone] Stream done. Total: ${totalChunks} chunks, ${totalBytes} bytes`);
+            break;
+          }
+          totalChunks++;
+          totalBytes += value?.length || 0;
+          // Reset stall timer on each chunk
+          clearTimeout(stallTimer);
+          stallTimer = setTimeout(() => {
+            console.error('[clone] Stream stalled - no data for 120s');
+            abortController.abort();
+          }, 120000);
           
-          const chunk = decoder.decode(value, { stream: true });
-          sseBuffer += chunk;
+          sseBuffer += decoder.decode(value, { stream: true });
           const lines = sseBuffer.split('\n');
-          
-          // Keep the last line in buffer if it might be incomplete
-          sseBuffer = lines.pop() || '';
+          sseBuffer = lines.pop() || ''; // Keep incomplete last line in buffer
           
           for (const line of lines) {
             if (line.startsWith('data: ')) {
+              console.log('[clone] SSE event:', line.slice(0, 120));
               try {
                 const data = JSON.parse(line.slice(6));
                 
@@ -3084,8 +3209,10 @@ Focus on the key sections and content, making it clean and modern.`;
                     addChatMessage(text.trim(), 'ai');
                   }
                 } else if (data.type === 'stream' && data.raw) {
-                  // Accumulate streamed code as fallback in case 'complete' never arrives
-                  streamedCodeAccumulator += data.text;
+                  // Accumulate raw stream text into local generatedCode
+                  // so we have it even if the 'complete' event never arrives
+                  generatedCode += data.text || '';
+                  
                   setGenerationProgress(prev => {
                     const newStreamedCode = prev.streamedCode + data.text;
                     
@@ -3181,9 +3308,11 @@ Focus on the key sections and content, making it clean and modern.`;
                     return updatedState;
                   });
                 } else if (data.type === 'complete') {
-                  generatedCode = data.generatedCode;
-                  explanation = data.explanation;
-                  console.log('[clone] Received complete event, generatedCode length:', generatedCode?.length || 0);
+                  // Use generatedCode from complete event if available (server-assembled is authoritative)
+                  if (data.generatedCode) {
+                    generatedCode = data.generatedCode;
+                  }
+                  explanation = data.explanation || '';
                   
                   // Save the last generated code
                   setConversationContext(prev => ({
@@ -3191,23 +3320,68 @@ Focus on the key sections and content, making it clean and modern.`;
                     lastGeneratedCode: generatedCode
                   }));
                 } else if (data.type === 'error') {
-                  console.error('[clone] Server error:', data.error || data.message);
-                  throw new Error(data.error || data.message || 'Server returned an error during generation');
-                } else if (data.type === 'warning' || data.type === 'info') {
-                  console.warn('[clone]', data.type, ':', data.message);
+                  streamError = new Error(data.error || data.message || 'AI generation failed');
+                } else if (data.type === 'info' || data.type === 'warning') {
+                  addChatMessage(data.message, 'system');
                 }
-              } catch (e: any) {
-                // Re-throw actual errors from error events
-                if (e?.message && !e.message.includes('JSON')) {
-                  throw e;
+              } catch (e) {
+                // Only swallow JSON parse errors, not application errors
+                if (e instanceof SyntaxError) {
+                  console.error('Failed to parse SSE JSON:', line.slice(0, 100));
+                } else {
+                  throw e; // Re-throw application errors
                 }
-                console.error('Failed to parse SSE data:', e);
               }
             }
           }
         }
         
-        console.log('[clone] Stream ended. generatedCode:', generatedCode?.length || 0, 'streamedAccum:', streamedCodeAccumulator?.length || 0);
+        // Flush any remaining data in sseBuffer after stream ends
+        if (sseBuffer.trim()) {
+          console.log('[clone] Flushing remaining SSE buffer:', sseBuffer.slice(0, 200));
+          // Process all remaining lines in the buffer
+          const remainingLines = sseBuffer.split('\n');
+          for (const line of remainingLines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                if (data.type === 'error') {
+                  streamError = new Error(data.error || data.message || 'AI generation failed');
+                } else if (data.type === 'stream' && data.raw) {
+                  generatedCode += data.text || '';
+                } else if (data.type === 'complete' && data.generatedCode) {
+                  generatedCode = data.generatedCode;
+                  explanation = data.explanation || '';
+                }
+              } catch (e) {
+                if (!(e instanceof SyntaxError)) throw e;
+              }
+            }
+          }
+        }
+        
+        // Clean up timers
+        clearTimeout(stallTimer);
+        clearTimeout(overallTimeout);
+        
+        // If server sent an error event, throw it now (after stream is fully read)
+        if (streamError) {
+          throw streamError;
+        }
+        
+        // If generatedCode was accumulated from stream events but the complete
+        // event was never received (server timeout/crash), we still have the code.
+        // Check if it contains actual file content.
+        if (!generatedCode || !generatedCode.includes('<file path=')) {
+          console.error(`[clone] Stream ended without generating usable code. generatedCode length: ${generatedCode.length}, totalChunks: ${totalChunks}, totalBytes: ${totalBytes}`);
+          throw new Error(`AI generation produced no usable code (received ${totalChunks} chunks, ${totalBytes} bytes but no file content). The AI model may have timed out or failed to respond. Please try again.`);
+        }
+        
+        // If we only have code from stream events (no complete event), log it
+        if (generatedCode && !explanation) {
+          console.log('[clone] No complete event received, using code accumulated from stream events (' + generatedCode.length + ' chars)');
+          addChatMessage('Generation stream ended early. Applying recovered code - some files may be incomplete.', 'system');
+        }
         
         setGenerationProgress(prev => ({
           ...prev,
@@ -3215,15 +3389,6 @@ Focus on the key sections and content, making it clean and modern.`;
           isStreaming: false,
           status: 'Generation complete!'
         }));
-        
-        // If 'complete' event never arrived (e.g. Vercel timeout), use accumulated stream data
-        if (!generatedCode && streamedCodeAccumulator) {
-          console.warn('[clone] complete event missing, using accumulated stream data as fallback, length:', streamedCodeAccumulator.length);
-          // Check if the streamed data contains usable file tags
-          if (streamedCodeAccumulator.includes('<file path=')) {
-            generatedCode = streamedCodeAccumulator;
-          }
-        }
         
         if (generatedCode) {
           addChatMessage('AI recreation generated!', 'system');
@@ -3236,9 +3401,8 @@ Focus on the key sections and content, making it clean and modern.`;
           setPromptInput(generatedCode);
 
           // Apply the code (first time is not edit mode)
-          // Pass createdSandbox as override to avoid stale closure issue where
-          // sandboxData is still null because setSandboxData hasn't re-rendered yet
-          await applyGeneratedCode(generatedCode, false, createdSandbox || undefined);
+          // Pass activeSandboxData to avoid "no iframe or sandbox URL" error
+          await applyGeneratedCode(generatedCode, false, activeSandboxData);
 
           addChatMessage(
             brandExtensionMode
@@ -3305,6 +3469,8 @@ Focus on the key sections and content, making it clean and modern.`;
           // Keep files to display in sidebar
           files: prev.files
         }));
+      } finally {
+        generationInProgress.current = false;
       }
     }, 500);
   };

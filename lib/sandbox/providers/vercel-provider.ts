@@ -5,6 +5,54 @@ import { SandboxProvider, SandboxInfo, CommandResult } from '../types';
 export class VercelProvider extends SandboxProvider {
   private existingFiles: Set<string> = new Set();
 
+  /**
+   * Reconnect to an existing Vercel sandbox by ID
+   */
+  async reconnect(sandboxId: string): Promise<boolean> {
+    try {
+      console.log(`[VercelProvider] Attempting to reconnect to sandbox ${sandboxId}...`);
+      
+      const connectConfig: any = {};
+      
+      // Add authentication
+      if (process.env.VERCEL_TOKEN && process.env.VERCEL_TEAM_ID && process.env.VERCEL_PROJECT_ID) {
+        connectConfig.teamId = process.env.VERCEL_TEAM_ID;
+        connectConfig.projectId = process.env.VERCEL_PROJECT_ID;
+        connectConfig.token = process.env.VERCEL_TOKEN;
+      } else if (process.env.VERCEL_OIDC_TOKEN) {
+        connectConfig.oidcToken = process.env.VERCEL_OIDC_TOKEN;
+      }
+      
+      // Use the Vercel SDK's get method to reconnect to an existing sandbox
+      this.sandbox = await Sandbox.get({ sandboxId, ...connectConfig });
+      
+      const sandboxUrl = this.sandbox.domain(5173);
+      
+      this.sandboxInfo = {
+        sandboxId,
+        url: sandboxUrl,
+        provider: 'vercel',
+        createdAt: new Date()
+      };
+      
+      // Track typical files that should exist
+      this.existingFiles.add('src/App.jsx');
+      this.existingFiles.add('src/main.jsx');
+      this.existingFiles.add('src/index.css');
+      this.existingFiles.add('index.html');
+      this.existingFiles.add('package.json');
+      this.existingFiles.add('vite.config.js');
+      this.existingFiles.add('tailwind.config.js');
+      this.existingFiles.add('postcss.config.js');
+      
+      console.log(`[VercelProvider] Successfully reconnected to sandbox ${sandboxId}, URL: ${sandboxUrl}`);
+      return true;
+    } catch (error) {
+      console.error(`[VercelProvider] Failed to reconnect to sandbox ${sandboxId}:`, error);
+      return false;
+    }
+  }
+
   async createSandbox(): Promise<SandboxInfo> {
     try {
       
