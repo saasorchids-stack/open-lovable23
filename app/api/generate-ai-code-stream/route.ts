@@ -176,19 +176,36 @@ export async function POST(request: NextRequest) {
       }
     };
     
-    // Safety timeout: send an error event before Vercel kills the function
-    // Vercel Hobby = 60s, so we abort at 55s to have time to send the error
+    // Shared accumulator accessible from both the safety timeout and the streaming loop
+    let sharedGeneratedCode = '';
+    
+    // Safety timeout: send partial results before Vercel kills the function
+    // Vercel Hobby = 60s, so we send at 55s to have time to flush
     const SAFETY_TIMEOUT_MS = 55000;
     const functionStartTime = Date.now();
     let safetyTimedOut = false;
     const safetyTimeout = setTimeout(async () => {
       safetyTimedOut = true;
-      console.error('[generate-ai-code-stream] SAFETY TIMEOUT: Function approaching Vercel limit');
+      console.warn('[generate-ai-code-stream] SAFETY TIMEOUT: Function approaching Vercel limit');
+      console.warn('[generate-ai-code-stream] Accumulated code length:', sharedGeneratedCode.length);
       try {
-        await sendProgress({ 
-          type: 'error', 
-          error: 'Generation timed out (55s). The AI model took too long. Try using Gemini 2.5 Flash for faster results.'
-        });
+        // If we have accumulated code with file tags, send it as a partial complete
+        // instead of an error so the client can still use the generated code
+        if (sharedGeneratedCode && sharedGeneratedCode.includes('<file path=')) {
+          console.warn('[generate-ai-code-stream] Sending partial code as complete event');
+          await sendProgress({ 
+            type: 'complete', 
+            generatedCode: sharedGeneratedCode,
+            explanation: 'Generation was cut short due to time limits, but partial code is available.',
+            partial: true,
+            model
+          });
+        } else {
+          await sendProgress({ 
+            type: 'error', 
+            error: 'Generation timed out (55s) with no usable code. The AI model took too long. Try a simpler prompt or Gemini 2.5 Flash.'
+          });
+        }
         await writer.close();
       } catch (e) {
         console.error('[generate-ai-code-stream] Error sending timeout event:', e);
@@ -1405,6 +1422,7 @@ It's better to have 3 complete files than 10 incomplete files.`
         }
         
         // Stream the response and parse in real-time
+        // Use the shared accumulator so the safety timeout can access partial code
         let generatedCode = '';
         let currentFile = '';
         let currentFilePath = '';
@@ -1434,6 +1452,7 @@ It's better to have 3 complete files than 10 incomplete files.`
         for await (const textPart of result?.textStream || []) {
           const text = textPart || '';
           generatedCode += text;
+          sharedGeneratedCode = generatedCode; // Keep shared ref in sync
           currentFile += text;
           
           // Combine with buffer for tag detection

@@ -3192,7 +3192,14 @@ Focus on the key sections and content, making it clean and modern.`;
                   }));
                 } else if (data.type === 'error') {
                   console.error('[clone] Server error:', data.error || data.message);
-                  throw new Error(data.error || data.message || 'Server returned an error during generation');
+                  // If we already have streamed code with file tags, don't throw — 
+                  // we can still use the partial generation
+                  if (streamedCodeAccumulator && streamedCodeAccumulator.includes('<file path=')) {
+                    console.warn('[clone] Server error received but we have partial code, continuing...');
+                    addChatMessage(`Warning: ${data.error || data.message}. Using partial generation.`, 'system');
+                  } else {
+                    throw new Error(data.error || data.message || 'Server returned an error during generation');
+                  }
                 } else if (data.type === 'warning' || data.type === 'info') {
                   console.warn('[clone]', data.type, ':', data.message);
                 }
