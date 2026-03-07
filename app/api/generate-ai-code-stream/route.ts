@@ -1319,7 +1319,7 @@ If you're running out of space, generate FEWER files but make them COMPLETE.
 It's better to have 3 complete files than 10 incomplete files.`
             }
           ],
-          maxTokens: isEdit ? 32768 : 16384, // Smaller for initial gen to fit in 60s
+          maxOutputTokens: isEdit ? 32768 : 16384, // Smaller for initial gen to fit in 60s
           stopSequences: [], // Don't stop early
           abortSignal: streamAbortController.signal, // Abort when safety timeout fires
           // Note: Neither Groq nor Anthropic models support tool/function calling in this context
@@ -1425,7 +1425,6 @@ It's better to have 3 complete files than 10 incomplete files.`
           }
         }, 5000); // Every 5 seconds
         
-        try {
         // Stream the response and parse for packages in real-time
         // The for-await loop will throw if the AbortController fires
         try {
@@ -1919,7 +1918,7 @@ RULES:
                   },
                   { role: 'user', content: simplifiedPrompt }
                 ],
-                maxTokens: 8192,
+                maxOutputTokens: 8192,
                 temperature: 0.7,
                 abortSignal: retryAbort.signal
               });
