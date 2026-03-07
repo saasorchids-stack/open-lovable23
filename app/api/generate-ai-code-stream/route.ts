@@ -180,8 +180,8 @@ export async function POST(request: NextRequest) {
     let sharedGeneratedCode = '';
     
     // Safety timeout: send partial results before Vercel kills the function
-    // Vercel Hobby = 60s, so we send at 55s to have time to flush
-    const SAFETY_TIMEOUT_MS = 55000;
+    // Vercel Hobby = 60s, send at 58s to maximize generation time
+    const SAFETY_TIMEOUT_MS = 58000;
     const functionStartTime = Date.now();
     let safetyTimedOut = false;
     const safetyTimeout = setTimeout(async () => {
@@ -203,7 +203,7 @@ export async function POST(request: NextRequest) {
         } else {
           await sendProgress({ 
             type: 'error', 
-            error: 'Generation timed out (55s) with no usable code. The AI model took too long. Try a simpler prompt or Gemini 2.5 Flash.'
+            error: 'Generation timed out (58s) with no usable code. The AI model took too long. Try a simpler URL or shorter prompt.'
           });
         }
         await writer.close();
@@ -934,7 +934,7 @@ UNDERSTANDING USER INTENT FOR INCREMENTAL VS FULL GENERATION:
 - "rebuild/recreate/start over" → Full regeneration
 - Default to incremental updates when working on an existing app
 
-SURGICAL EDIT RULES (CRITICAL FOR PERFORMANCE):
+${isEdit ? `SURGICAL EDIT RULES (CRITICAL FOR PERFORMANCE):
 - **PREFER TARGETED CHANGES**: Don't regenerate entire components for small edits
 - For color/style changes: Edit ONLY the specific className or style prop
 - For text changes: Change ONLY the text content, keep everything else
@@ -946,26 +946,18 @@ SURGICAL EDIT RULES (CRITICAL FOR PERFORMANCE):
   - New feature = 2 files MAX (feature + parent)
 - If you're editing >3 files for a simple request, STOP - you're doing too much
 
-EXAMPLES OF CORRECT SURGICAL EDITS:
-✅ "change header to black" → Find className="..." in Header.jsx, change ONLY color classes
-✅ "update hero text" → Find the <h1> or <p> in Hero.jsx, change ONLY the text inside
-✅ "add a button to hero" → Find the return statement, ADD button, keep everything else
-❌ WRONG: Regenerating entire Header.jsx to change one color
-❌ WRONG: Rewriting Hero.jsx to add one button
-
 NAVIGATION/HEADER INTELLIGENCE:
 - ALWAYS check App.jsx imports first
 - Navigation is usually INSIDE Header.jsx, not separate
 - If user says "nav", check Header.jsx FIRST
 - Only create Nav.jsx if no navigation exists anywhere
-- Logo, menu, hamburger = all typically in Header
 
 CRITICAL: When files are provided in the context:
 1. The user is asking you to MODIFY the existing app, not create a new one
 2. Find the relevant file(s) from the provided context
 3. Generate ONLY the files that need changes
 4. Do NOT ask to see files - they are already provided in the context above
-5. Make the requested change immediately`;
+5. Make the requested change immediately` : ''}`;
 
         // If Morph Fast Apply is enabled (edit mode + MORPH_API_KEY), force <edit> block output
         const morphFastApplyEnabled = Boolean(isEdit && process.env.MORPH_API_KEY);
@@ -1345,7 +1337,7 @@ If you're running out of space, generate FEWER files but make them COMPLETE.
 It's better to have 3 complete files than 10 incomplete files.`
             }
           ],
-          maxTokens: 32768, // Ample for complete code generation
+          maxTokens: isEdit ? 32768 : 16384, // Smaller for initial gen to fit in 60s
           stopSequences: [] // Don't stop early
           // Note: Neither Groq nor Anthropic models support tool/function calling in this context
           // We use XML tags for package detection instead
@@ -1878,15 +1870,94 @@ Provide the complete file content without any truncation. Include all necessary 
         const streamDurationMs = Date.now() - functionStartTime;
         console.log(`[generate-ai-code-stream] Stream completed in ${streamDurationMs}ms, code length: ${generatedCode.length}, files: ${files.length}`);
         
-        // Guard: if generatedCode is empty, send an error instead of an empty complete
+        // Guard: if generatedCode is empty, try a fast retry with simplified prompt
         if (!generatedCode || !generatedCode.includes('<file path=')) {
+          const timeRemainingMs = SAFETY_TIMEOUT_MS - (Date.now() - functionStartTime);
           console.error('[generate-ai-code-stream] Stream produced no usable code!');
           console.error('[generate-ai-code-stream] generatedCode length:', generatedCode.length);
           console.error('[generate-ai-code-stream] generatedCode preview:', generatedCode.substring(0, 500));
-          await sendProgress({
-            type: 'error',
-            error: `AI model produced no code (${streamDurationMs}ms elapsed). The model may have failed silently. Please try again.`
-          });
+          console.log('[generate-ai-code-stream] Time remaining for retry:', timeRemainingMs, 'ms');
+          
+          // Auto-retry if we have at least 20s remaining
+          if (timeRemainingMs > 20000 && !safetyTimedOut) {
+            console.log('[generate-ai-code-stream] Attempting fast retry with simplified prompt...');
+            await sendProgress({ type: 'info', message: 'First attempt produced no code. Retrying with optimized prompt...' });
+            
+            try {
+              // Strip down the user prompt — keep just the essential request
+              const simplifiedPrompt = fullPrompt.length > 3000
+                ? fullPrompt.substring(0, 3000) + '\n\n[Content truncated. Focus on generating the core App.jsx, index.css, and 2-3 key components.]'
+                : fullPrompt;
+              
+              const retryResult = await streamText({
+                model: modelProvider(actualModel),
+                messages: [
+                  {
+                    role: 'system',
+                    content: `You are an expert React developer. Generate a complete Vite React app using Tailwind CSS.
+Use this XML format:
+<file path="src/index.css">
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+</file>
+<file path="src/App.jsx">
+// code
+</file>
+<file path="src/components/Example.jsx">
+// code  
+</file>
+
+RULES:
+- Use ONLY standard Tailwind classes (bg-white, text-gray-900, etc.)
+- Complete EVERY file — no truncation
+- Generate 3-5 files max
+- NO external packages except React`
+                  },
+                  { role: 'user', content: simplifiedPrompt }
+                ],
+                maxTokens: 8192,
+                temperature: 0.7
+              });
+              
+              let retryCode = '';
+              for await (const chunk of retryResult.textStream) {
+                retryCode += chunk;
+                sharedGeneratedCode = retryCode;
+                // Stream chunks to client
+                await sendProgress({ type: 'stream', text: chunk, raw: true });
+              }
+              
+              if (retryCode && retryCode.includes('<file path=')) {
+                console.log('[generate-ai-code-stream] Retry succeeded! Code length:', retryCode.length);
+                generatedCode = retryCode;
+              } else {
+                console.error('[generate-ai-code-stream] Retry also produced no code');
+              }
+            } catch (retryError) {
+              console.error('[generate-ai-code-stream] Retry failed:', retryError);
+            }
+          }
+          
+          // After retry attempt (or if no time for retry), check again
+          if (!generatedCode || !generatedCode.includes('<file path=')) {
+            await sendProgress({
+              type: 'error',
+              error: `AI model produced no code (${streamDurationMs}ms elapsed). The model may have failed silently. Please try again.`
+            });
+          } else {
+            // Retry succeeded — send as complete
+            const retryFiles = (generatedCode.match(/<file path="/g) || []).length;
+            await sendProgress({ 
+              type: 'complete', 
+              generatedCode,
+              explanation: 'Generated with optimized retry.',
+              files: retryFiles,
+              components: retryFiles,
+              model,
+              warnings: ['Generation required a retry with simplified prompt.']
+            });
+          }
         } else {
           // Send completion with packages info
           await sendProgress({ 
