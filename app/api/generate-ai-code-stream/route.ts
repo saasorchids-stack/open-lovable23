@@ -198,6 +198,7 @@ export async function POST(request: NextRequest) {
     (async () => {
       try {
         // Send initial status
+        await sendProgress({ type: 'start', buildVersion: '2025-07-12-v3', model, isEdit });
         await sendProgress({ type: 'status', message: 'Initializing AI...' });
         
         // No keep-alive needed - sandbox provisioned for 10 minutes
@@ -1255,6 +1256,8 @@ MORPH FAST APPLY MODE (EDIT-ONLY):
         console.log(`[generate-ai-code-stream] Using provider: ${isAnthropic ? 'Anthropic' : isGoogle ? 'Google' : isOpenAI ? 'OpenAI' : 'Groq'}, model: ${actualModel}`);
         console.log(`[generate-ai-code-stream] AI Gateway enabled: ${isUsingAIGateway}`);
         console.log(`[generate-ai-code-stream] Model string: ${model}`);
+        console.log(`[generate-ai-code-stream] API key available: ${isGoogle ? !!process.env.GEMINI_API_KEY : isAnthropic ? !!process.env.ANTHROPIC_API_KEY : isOpenAI ? !!process.env.OPENAI_API_KEY : !!process.env.GROQ_API_KEY}`);
+        console.log(`[generate-ai-code-stream] Build version: 2025-07-12-v3`);
 
         // Make streaming API call with appropriate provider
         const streamOptions: any = {

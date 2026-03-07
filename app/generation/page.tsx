@@ -3071,10 +3071,12 @@ Focus on the key sections and content, making it clean and modern.`;
                 eventCount++;
                 // Log non-stream events for diagnostics
                 if (data.type !== 'stream') {
-                  console.log(`[clone] SSE event #${eventCount}: type=${data.type}`);
+                  console.log(`[clone] SSE event #${eventCount}: type=${data.type}`, data.buildVersion ? `build=${data.buildVersion}` : '');
                 }
                 
-                if (data.type === 'status') {
+                if (data.type === 'start') {
+                  console.log(`[clone] ✅ Server connected! Build: ${data.buildVersion}, Model: ${data.model}, isEdit: ${data.isEdit}`);
+                } else if (data.type === 'status') {
                   setGenerationProgress(prev => ({ ...prev, status: data.message }));
                 } else if (data.type === 'thinking') {
                   setGenerationProgress(prev => ({ 
