@@ -179,37 +179,19 @@ export async function POST(request: NextRequest) {
     // Shared accumulator accessible from both the safety timeout and the streaming loop
     let sharedGeneratedCode = '';
     
-    // Safety timeout: send partial results before Vercel kills the function
-    // Vercel Hobby = 60s, send at 58s to maximize generation time
-    const SAFETY_TIMEOUT_MS = 58000;
+    // AbortController to cleanly stop the streamText when approaching Vercel's 60s limit
+    const streamAbortController = new AbortController();
+    
+    // Safety timeout: abort the stream before Vercel kills the function
+    // Vercel Hobby = 60s hard limit. We abort at 50s to leave time for retry + flush.
+    const SAFETY_TIMEOUT_MS = 50000;
     const functionStartTime = Date.now();
     let safetyTimedOut = false;
-    const safetyTimeout = setTimeout(async () => {
+    const safetyTimeout = setTimeout(() => {
       safetyTimedOut = true;
-      console.warn('[generate-ai-code-stream] SAFETY TIMEOUT: Function approaching Vercel limit');
+      console.warn('[generate-ai-code-stream] SAFETY TIMEOUT: Aborting stream at 50s');
       console.warn('[generate-ai-code-stream] Accumulated code length:', sharedGeneratedCode.length);
-      try {
-        // If we have accumulated code with file tags, send it as a partial complete
-        // instead of an error so the client can still use the generated code
-        if (sharedGeneratedCode && sharedGeneratedCode.includes('<file path=')) {
-          console.warn('[generate-ai-code-stream] Sending partial code as complete event');
-          await sendProgress({ 
-            type: 'complete', 
-            generatedCode: sharedGeneratedCode,
-            explanation: 'Generation was cut short due to time limits, but partial code is available.',
-            partial: true,
-            model
-          });
-        } else {
-          await sendProgress({ 
-            type: 'error', 
-            error: 'Generation timed out (58s) with no usable code. The AI model took too long. Try a simpler URL or shorter prompt.'
-          });
-        }
-        await writer.close();
-      } catch (e) {
-        console.error('[generate-ai-code-stream] Error sending timeout event:', e);
-      }
+      streamAbortController.abort('Generation timeout');
     }, SAFETY_TIMEOUT_MS);
     
     // Start processing in background
@@ -1338,7 +1320,8 @@ It's better to have 3 complete files than 10 incomplete files.`
             }
           ],
           maxTokens: isEdit ? 32768 : 16384, // Smaller for initial gen to fit in 60s
-          stopSequences: [] // Don't stop early
+          stopSequences: [], // Don't stop early
+          abortSignal: streamAbortController.signal, // Abort when safety timeout fires
           // Note: Neither Groq nor Anthropic models support tool/function calling in this context
           // We use XML tags for package detection instead
         };
@@ -1444,7 +1427,10 @@ It's better to have 3 complete files than 10 incomplete files.`
         
         try {
         // Stream the response and parse for packages in real-time
+        // The for-await loop will throw if the AbortController fires
+        try {
         for await (const textPart of result?.textStream || []) {
+          if (safetyTimedOut) break; // Extra check in case abort doesn't throw immediately
           const text = textPart || '';
           generatedCode += text;
           sharedGeneratedCode = generatedCode; // Keep shared ref in sync
@@ -1554,6 +1540,18 @@ It's better to have 3 complete files than 10 incomplete files.`
           }
         }
         
+        } catch (streamLoopError: any) {
+          // Catch abort errors from the AbortController
+          const isAbort = streamLoopError?.name === 'AbortError' || 
+                          streamLoopError?.message?.includes('abort') ||
+                          streamLoopError?.message?.includes('signal') ||
+                          safetyTimedOut;
+          if (isAbort) {
+            console.warn('[generate-ai-code-stream] Stream aborted by safety timeout. Code so far:', generatedCode.length, 'chars');
+          } else {
+            // Re-throw non-abort errors
+            throw streamLoopError;
+          }
         } finally {
           // Stop keepalive interval once streaming is done
           keepaliveActive = false;
@@ -1872,16 +1870,21 @@ Provide the complete file content without any truncation. Include all necessary 
         
         // Guard: if generatedCode is empty, try a fast retry with simplified prompt
         if (!generatedCode || !generatedCode.includes('<file path=')) {
-          const timeRemainingMs = SAFETY_TIMEOUT_MS - (Date.now() - functionStartTime);
+          const elapsedMs = Date.now() - functionStartTime;
+          const timeRemainingMs = 58000 - elapsedMs; // Hard deadline at 58s (Vercel kills at 60s)
           console.error('[generate-ai-code-stream] Stream produced no usable code!');
           console.error('[generate-ai-code-stream] generatedCode length:', generatedCode.length);
           console.error('[generate-ai-code-stream] generatedCode preview:', generatedCode.substring(0, 500));
-          console.log('[generate-ai-code-stream] Time remaining for retry:', timeRemainingMs, 'ms');
+          console.log(`[generate-ai-code-stream] Elapsed: ${elapsedMs}ms, time remaining: ${timeRemainingMs}ms, safetyTimedOut: ${safetyTimedOut}`);
           
-          // Auto-retry if we have at least 20s remaining
-          if (timeRemainingMs > 20000 && !safetyTimedOut) {
+          // Auto-retry if we have at least 8s remaining (even after safety timeout abort)
+          if (timeRemainingMs > 8000) {
             console.log('[generate-ai-code-stream] Attempting fast retry with simplified prompt...');
-            await sendProgress({ type: 'info', message: 'First attempt produced no code. Retrying with optimized prompt...' });
+            await sendProgress({ type: 'info', message: 'Retrying with optimized prompt...' });
+            
+            // Abort retry 2s before the hard deadline
+            const retryAbort = new AbortController();
+            const retryTimeoutId = setTimeout(() => retryAbort.abort(), timeRemainingMs - 2000);
             
             try {
               // Strip down the user prompt — keep just the essential request
@@ -1917,7 +1920,8 @@ RULES:
                   { role: 'user', content: simplifiedPrompt }
                 ],
                 maxTokens: 8192,
-                temperature: 0.7
+                temperature: 0.7,
+                abortSignal: retryAbort.signal
               });
               
               let retryCode = '';
@@ -1934,8 +1938,16 @@ RULES:
               } else {
                 console.error('[generate-ai-code-stream] Retry also produced no code');
               }
-            } catch (retryError) {
-              console.error('[generate-ai-code-stream] Retry failed:', retryError);
+            } catch (retryError: any) {
+              // If retry was aborted, check if we got partial code
+              if (sharedGeneratedCode && sharedGeneratedCode.includes('<file path=')) {
+                console.log('[generate-ai-code-stream] Retry aborted but got partial code:', sharedGeneratedCode.length);
+                generatedCode = sharedGeneratedCode;
+              } else {
+                console.error('[generate-ai-code-stream] Retry failed:', retryError?.message || retryError);
+              }
+            } finally {
+              clearTimeout(retryTimeoutId);
             }
           }
           
@@ -2003,12 +2015,6 @@ RULES:
       } catch (error) {
         console.error('[generate-ai-code-stream] Stream processing error:', error);
         
-        // Don't send error if safety timeout already fired
-        if (safetyTimedOut) {
-          console.error('[generate-ai-code-stream] Skipping error send - safety timeout already fired');
-          return;
-        }
-        
         // Check if it's a tool validation error
         if ((error as any).message?.includes('tool call validation failed')) {
           console.error('[generate-ai-code-stream] Tool call validation error - this may be due to the AI model sending incorrect parameters');
@@ -2016,17 +2022,23 @@ RULES:
             type: 'warning', 
             message: 'Package installation tool encountered an issue. Packages will be detected from imports instead.'
           });
-          // Continue processing - packages can still be detected from the code
         } else {
-          await sendProgress({ 
-            type: 'error', 
-            error: (error as Error).message 
-          });
+          try {
+            await sendProgress({ 
+              type: 'error', 
+              error: (error as Error).message 
+            });
+          } catch (writeErr) {
+            console.error('[generate-ai-code-stream] Failed to send error event:', writeErr);
+          }
         }
       } finally {
         clearTimeout(safetyTimeout);
-        if (!safetyTimedOut) {
+        try {
           await writer.close();
+        } catch (closeErr) {
+          // Writer may already be closed
+          console.error('[generate-ai-code-stream] Writer close error (may be expected):', closeErr);
         }
       }
     })();
