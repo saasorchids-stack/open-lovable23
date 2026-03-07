@@ -2054,6 +2054,7 @@ RULES:
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
         'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'X-Build-Version': '2025-07-12-v3',
       },
     });
     

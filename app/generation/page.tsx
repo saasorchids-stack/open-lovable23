@@ -3036,13 +3036,15 @@ Focus on the key sections and content, making it clean and modern.`;
           })
         });
         
+        console.log('[clone] Fetch response:', aiResponse.status, aiResponse.statusText, 'content-type:', aiResponse.headers.get('content-type'), 'build-version:', aiResponse.headers.get('x-build-version'));
+        
         if (!aiResponse.ok || !aiResponse.body) {
           const errorText = aiResponse.ok ? '' : await aiResponse.text().catch(() => '');
-          console.error('[clone] API response not ok:', aiResponse.status, errorText.substring(0, 200));
-          throw new Error(`Failed to generate code (HTTP ${aiResponse.status})`);
+          console.error('[clone] API response not ok:', aiResponse.status, errorText.substring(0, 500));
+          throw new Error(`Failed to generate code (HTTP ${aiResponse.status}): ${errorText.substring(0, 100)}`);
         }
         
-        console.log('[clone] Stream connected, reading events...');
+        console.log('[clone] Stream connected, reading events... Model:', aiModel);
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let generatedCode = '';
@@ -3249,6 +3251,89 @@ Focus on the key sections and content, making it clean and modern.`;
           }
         }
         
+        // Also check generation progress state for accumulated files
+        if (!generatedCode) {
+          console.warn('[clone] No generatedCode or streamedCodeAccumulator. Checking generation progress files...');
+        }
+        
+        // CLIENT-SIDE RETRY: If first attempt failed, retry with simplified prompt
+        if (!generatedCode || !generatedCode.includes('<file path=')) {
+          console.warn('[clone] First generation attempt failed. Retrying with simplified prompt...');
+          addChatMessage('First attempt did not produce code. Retrying...', 'system');
+          
+          // Build a simpler prompt
+          const retryPrompt = `Create a simple React landing page clone of ${url}. 
+Use Tailwind CSS. Create 3 files: src/index.css (with @tailwind directives), src/App.jsx (main component), and src/components/Hero.jsx.
+Include a header with navigation, hero section, features section, and footer.
+Use standard Tailwind classes only (bg-white, text-gray-900, etc).
+Make it responsive and modern.`;
+          
+          try {
+            const retryResponse = await fetch('/api/generate-ai-code-stream', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ 
+                prompt: retryPrompt,
+                model: aiModel,
+                context: {
+                  sandboxId: (createdSandbox || sandboxData)?.sandboxId,
+                  conversationContext: {}
+                }
+              })
+            });
+            
+            if (retryResponse.ok && retryResponse.body) {
+              const retryReader = retryResponse.body.getReader();
+              const retryDecoder = new TextDecoder();
+              let retryBuffer = '';
+              let retryCode = '';
+              let retryAccum = '';
+              
+              while (true) {
+                const { done, value } = await retryReader.read();
+                if (done) break;
+                
+                const chunk = retryDecoder.decode(value, { stream: true });
+                retryBuffer += chunk;
+                const lines = retryBuffer.split('\n');
+                retryBuffer = lines.pop() || '';
+                
+                for (const line of lines) {
+                  if (line.startsWith('data: ')) {
+                    try {
+                      const data = JSON.parse(line.slice(6));
+                      if (data.type === 'complete' && data.generatedCode) {
+                        retryCode = data.generatedCode;
+                      } else if (data.type === 'stream' && data.raw) {
+                        retryAccum += data.text;
+                        setGenerationProgress(prev => ({
+                          ...prev,
+                          streamedCode: prev.streamedCode + data.text,
+                          isStreaming: true,
+                          status: 'Generating code (retry)...'
+                        }));
+                      } else if (data.type === 'error') {
+                        console.error('[clone] Retry error:', data.error);
+                      }
+                    } catch {}
+                  }
+                }
+              }
+              
+              // Use retry results
+              if (retryCode && retryCode.includes('<file path=')) {
+                generatedCode = retryCode;
+                console.log('[clone] Retry succeeded! Code length:', generatedCode.length);
+              } else if (retryAccum && retryAccum.includes('<file path=')) {
+                generatedCode = retryAccum;
+                console.log('[clone] Retry succeeded via accumulator! Code length:', generatedCode.length);
+              }
+            }
+          } catch (retryErr) {
+            console.error('[clone] Client-side retry failed:', retryErr);
+          }
+        }
+        
         if (generatedCode) {
           addChatMessage('AI recreation generated!', 'system');
           
@@ -3285,7 +3370,8 @@ Focus on the key sections and content, making it clean and modern.`;
             }]
           }));
         } else {
-          throw new Error('Failed to generate recreation');
+          console.error('[clone] FINAL FAILURE - no code generated after retry. eventCount:', eventCount, 'streamedAccumLen:', streamedCodeAccumulator.length);
+          throw new Error(`Failed to generate recreation (events: ${eventCount}, stream: ${streamedCodeAccumulator.length} chars). The AI returned no usable code. Try again or use a different model.`);
         }
         
         setUrlInput('');
