@@ -1348,55 +1348,56 @@ It's better to have 3 complete files than 10 incomplete files.`
         
         let result;
         let retryCount = 0;
-        const maxRetries = 2;
+        const maxRetries = 3;
         
         while (retryCount <= maxRetries) {
           try {
             result = await streamText(streamOptions);
             break; // Success, exit retry loop
           } catch (streamError: any) {
-            console.error(`[generate-ai-code-stream] Error calling streamText (attempt ${retryCount + 1}/${maxRetries + 1}):`, streamError);
+            const errMsg = streamError.message || String(streamError);
+            console.error(`[generate-ai-code-stream] Error calling streamText (attempt ${retryCount + 1}/${maxRetries + 1}):`, errMsg.substring(0, 500));
             
-            // Check if this is a Groq service unavailable error
-            const isGroqServiceError = isKimiGroq && streamError.message?.includes('Service unavailable');
-            const isRetryableError = streamError.message?.includes('Service unavailable') || 
-                                    streamError.message?.includes('rate limit') ||
-                                    streamError.message?.includes('timeout');
+            // Detect quota/rate-limit errors (Google free tier)
+            const isQuotaError = errMsg.includes('quota') || errMsg.includes('Quota') || errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED');
+            const isRateLimitError = errMsg.includes('rate limit') || errMsg.includes('Rate limit') || errMsg.includes('too many requests');
+            const isGroqServiceError = isKimiGroq && errMsg.includes('Service unavailable');
+            const isRetryableError = isQuotaError || isRateLimitError || isGroqServiceError || errMsg.includes('Service unavailable') || errMsg.includes('timeout') || errMsg.includes('ECONNRESET');
             
             if (retryCount < maxRetries && isRetryableError) {
               retryCount++;
-              console.log(`[generate-ai-code-stream] Retrying in ${retryCount * 2} seconds...`);
               
-              // Send progress update about retry
-              await sendProgress({ 
-                type: 'info', 
-                message: `Service temporarily unavailable, retrying (attempt ${retryCount + 1}/${maxRetries + 1})...` 
-              });
+              // For quota errors on Google, try switching model first
+              if (isQuotaError && isGoogle && actualModel === 'gemini-2.0-flash') {
+                console.log('[generate-ai-code-stream] Quota exceeded on gemini-2.0-flash, switching to gemini-2.5-flash');
+                actualModel = 'gemini-2.5-flash';
+                streamOptions.model = googleGenerativeAI('gemini-2.5-flash');
+                await sendProgress({ type: 'info', message: 'Quota exceeded on gemini-2.0-flash, switching to gemini-2.5-flash...' });
+              } else if (isQuotaError && isGoogle && actualModel === 'gemini-2.5-flash') {
+                // Both Gemini models quota exhausted — wait longer
+                const waitSec = Math.min(retryCount * 15, 30);
+                console.log(`[generate-ai-code-stream] Quota also exceeded on 2.5-flash, waiting ${waitSec}s...`);
+                await sendProgress({ type: 'info', message: `API rate limit hit. Waiting ${waitSec}s before retry...` });
+                await new Promise(resolve => setTimeout(resolve, waitSec * 1000));
+              } else {
+                const waitMs = retryCount * 3000;
+                console.log(`[generate-ai-code-stream] Retrying in ${waitMs}ms...`);
+                await sendProgress({ type: 'info', message: `Retrying (attempt ${retryCount + 1}/${maxRetries + 1})... ${isQuotaError ? 'API quota limit reached, waiting...' : ''}` });
+                await new Promise(resolve => setTimeout(resolve, waitMs));
+              }
               
-              // Wait before retry with exponential backoff
-              await new Promise(resolve => setTimeout(resolve, retryCount * 2000));
-              
-              // If Groq fails, try switching to a fallback model
+              // If Groq fails on last retry, try Gemini as fallback
               if (isGroqServiceError && retryCount === maxRetries) {
-                console.log('[generate-ai-code-stream] Groq service unavailable, falling back to GPT-4');
-                streamOptions.model = openai('gpt-4-turbo');
-                actualModel = 'gpt-4-turbo';
+                console.log('[generate-ai-code-stream] Groq service unavailable, falling back to gemini-2.5-flash');
+                streamOptions.model = googleGenerativeAI('gemini-2.5-flash');
+                actualModel = 'gemini-2.5-flash';
               }
             } else {
-              // Final error, send to user
-              await sendProgress({ 
-                type: 'error', 
-                message: `Failed to initialize ${isGoogle ? 'Gemini' : isAnthropic ? 'Claude' : isOpenAI ? 'GPT-5' : isKimiGroq ? 'Kimi (Groq)' : 'Groq'} streaming: ${streamError.message}` 
-              });
-              
-              // If this is a Google model error, provide helpful info
-              if (isGoogle) {
-                await sendProgress({ 
-                  type: 'info', 
-                  message: 'Tip: Make sure your GEMINI_API_KEY is set correctly and has proper permissions.' 
-                });
-              }
-              
+              // Final error — send detailed message to the user
+              const userError = isQuotaError 
+                ? `Gemini API quota exceeded. Your API key has hit the free-tier limit. Please enable billing at https://aistudio.google.com or wait a few minutes.`
+                : `Failed to call ${isGoogle ? 'Gemini' : isAnthropic ? 'Claude' : isOpenAI ? 'GPT-5' : 'Groq'}: ${errMsg.substring(0, 300)}`;
+              await sendProgress({ type: 'error', error: userError });
               throw streamError;
             }
           }
@@ -1543,16 +1544,22 @@ It's better to have 3 complete files than 10 incomplete files.`
         }
         
         } catch (streamLoopError: any) {
+          const errMsg = streamLoopError?.message || String(streamLoopError);
           // Catch abort errors from the AbortController
           const isAbort = streamLoopError?.name === 'AbortError' || 
-                          streamLoopError?.message?.includes('abort') ||
-                          streamLoopError?.message?.includes('signal') ||
+                          errMsg.includes('abort') ||
+                          errMsg.includes('signal') ||
                           safetyTimedOut;
+          const isQuota = errMsg.includes('quota') || errMsg.includes('Quota') || errMsg.includes('RESOURCE_EXHAUSTED');
+          
           if (isAbort) {
             console.warn('[generate-ai-code-stream] Stream aborted by safety timeout. Code so far:', generatedCode.length, 'chars');
+          } else if (isQuota) {
+            console.error('[generate-ai-code-stream] Quota error during streaming:', errMsg.substring(0, 300));
+            await sendProgress({ type: 'error', error: 'Gemini API quota exceeded during generation. Your free-tier limit was hit. Please wait 1-2 minutes and try again, or enable billing at https://aistudio.google.com' });
           } else {
-            // Re-throw non-abort errors
-            throw streamLoopError;
+            console.error('[generate-ai-code-stream] Stream loop error:', errMsg.substring(0, 500));
+            await sendProgress({ type: 'error', error: `Stream error: ${errMsg.substring(0, 200)}` });
           }
         } finally {
           // Stop keepalive interval once streaming is done

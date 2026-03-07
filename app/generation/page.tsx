@@ -3041,7 +3041,10 @@ Focus on the key sections and content, making it clean and modern.`;
         if (!aiResponse.ok || !aiResponse.body) {
           const errorText = aiResponse.ok ? '' : await aiResponse.text().catch(() => '');
           console.error('[clone] API response not ok:', aiResponse.status, errorText.substring(0, 500));
-          throw new Error(`Failed to generate code (HTTP ${aiResponse.status}): ${errorText.substring(0, 100)}`);
+          // Try to parse JSON error from server
+          let detail = '';
+          try { detail = JSON.parse(errorText).error || ''; } catch { detail = errorText.substring(0, 200); }
+          throw new Error(`Generation API error (HTTP ${aiResponse.status}): ${detail || 'Unknown error'}`);
         }
         
         console.log('[clone] Stream connected, reading events... Model:', aiModel);
@@ -3212,17 +3215,19 @@ Focus on the key sections and content, making it clean and modern.`;
                     lastGeneratedCode: generatedCode
                   }));
                 } else if (data.type === 'error') {
-                  console.error('[clone] Server error:', data.error || data.message);
+                  const errDetail = data.error || data.message || 'Unknown server error';
+                  console.error('[clone] Server error:', errDetail);
+                  addChatMessage(`Error: ${errDetail}`, 'system');
                   // If we already have streamed code with file tags, don't throw — 
                   // we can still use the partial generation
                   if (streamedCodeAccumulator && streamedCodeAccumulator.includes('<file path=')) {
                     console.warn('[clone] Server error received but we have partial code, continuing...');
-                    addChatMessage(`Warning: ${data.error || data.message}. Using partial generation.`, 'system');
                   } else {
-                    throw new Error(data.error || data.message || 'Server returned an error during generation');
+                    throw new Error(errDetail);
                   }
                 } else if (data.type === 'warning' || data.type === 'info') {
                   console.warn('[clone]', data.type, ':', data.message);
+                  addChatMessage(`${data.type === 'warning' ? '⚠️' : 'ℹ️'} ${data.message}`, 'system');
                 }
               } catch (e: any) {
                 // Re-throw actual errors from error events
@@ -3403,7 +3408,8 @@ Make it responsive and modern.`;
           setActiveTab('preview');
         }, 1000); // Show completion briefly then switch
       } catch (error: any) {
-        addChatMessage(`Failed to clone website: ${error.message}`, 'system');
+        console.error('[clone] CATCH ERROR:', error.message, error);
+        addChatMessage(`❌ ${error.message}`, 'system');
         setUrlStatus([]);
         setIsPreparingDesign(false);
         setIsStartingNewGeneration(false); // Clear new generation flag on error
@@ -3413,7 +3419,7 @@ Make it responsive and modern.`;
           ...prev,
           isGenerating: false,
           isStreaming: false,
-          status: '',
+          status: `Error: ${error.message?.substring(0, 100)}`,
           // Keep files to display in sidebar
           files: prev.files
         }));

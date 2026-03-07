@@ -50,8 +50,8 @@ export const appConfig = {
   
   // AI Model Configuration
   ai: {
-    // Default AI model - use gemini-2.0-flash (non-thinking, fast, reliable)
-    defaultModel: 'google/gemini-2.0-flash',
+    // Default AI model - use gemini-2.5-flash (fast, reliable, good free-tier quota)
+    defaultModel: 'google/gemini-2.5-flash',
     
     // Available models
     availableModels: [
