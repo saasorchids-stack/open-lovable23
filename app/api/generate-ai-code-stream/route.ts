@@ -1356,19 +1356,8 @@ It's better to have 3 complete files than 10 incomplete files.`
           streamOptions.temperature = 0.7;
         }
         
-        // For Google models: disable thinking to avoid 30+ second delays
-        // Gemini 2.5 Flash thinks by default, which consumes most of the 55s budget
-        // With thinkingBudget: 0, the model skips thinking and outputs directly
-        if (isGoogle) {
-          streamOptions.providerOptions = {
-            google: {
-              thinkingConfig: {
-                thinkingBudget: 0
-              }
-            }
-          };
-          console.log('[generate-ai-code-stream] Google model: thinking disabled (thinkingBudget: 0) for speed');
-        }
+        // No special providerOptions for Google — use non-thinking models
+        // (gemini-2.0-flash) as default for reliable, fast generation
         
         // Add reasoning effort for GPT-5 models
         if (isOpenAI) {
