@@ -1345,20 +1345,29 @@ If you're running out of space, generate FEWER files but make them COMPLETE.
 It's better to have 3 complete files than 10 incomplete files.`
             }
           ],
-          maxTokens: 65536, // Generous limit for complete code generation
+          maxTokens: 32768, // Ample for complete code generation
           stopSequences: [] // Don't stop early
           // Note: Neither Groq nor Anthropic models support tool/function calling in this context
           // We use XML tags for package detection instead
         };
         
-        // Add temperature for non-reasoning models
-        // Skip temperature for Google thinking models (Gemini 2.5+) — Google API rejects it
-        const isGoogleThinkingModel = isGoogle && (actualModel.includes('2.5') || actualModel.includes('3-'));
-        if (!model.startsWith('openai/gpt-5') && !isGoogleThinkingModel) {
+        // Add temperature for non-reasoning models (skip for GPT-5 reasoning)
+        if (!model.startsWith('openai/gpt-5')) {
           streamOptions.temperature = 0.7;
         }
-        if (isGoogleThinkingModel) {
-          console.log('[generate-ai-code-stream] Skipping temperature for Google thinking model:', actualModel);
+        
+        // For Google models: disable thinking to avoid 30+ second delays
+        // Gemini 2.5 Flash thinks by default, which consumes most of the 55s budget
+        // With thinkingBudget: 0, the model skips thinking and outputs directly
+        if (isGoogle) {
+          streamOptions.providerOptions = {
+            google: {
+              thinkingConfig: {
+                thinkingBudget: 0
+              }
+            }
+          };
+          console.log('[generate-ai-code-stream] Google model: thinking disabled (thinkingBudget: 0) for speed');
         }
         
         // Add reasoning effort for GPT-5 models

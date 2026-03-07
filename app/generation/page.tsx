@@ -3037,15 +3037,19 @@ Focus on the key sections and content, making it clean and modern.`;
         });
         
         if (!aiResponse.ok || !aiResponse.body) {
-          throw new Error('Failed to generate code');
+          const errorText = aiResponse.ok ? '' : await aiResponse.text().catch(() => '');
+          console.error('[clone] API response not ok:', aiResponse.status, errorText.substring(0, 200));
+          throw new Error(`Failed to generate code (HTTP ${aiResponse.status})`);
         }
         
+        console.log('[clone] Stream connected, reading events...');
         const reader = aiResponse.body.getReader();
         const decoder = new TextDecoder();
         let generatedCode = '';
         let explanation = '';
         let sseBuffer = ''; // Buffer for incomplete SSE lines
         let streamedCodeAccumulator = ''; // Track code from stream events as fallback
+        let eventCount = 0;
         
         while (true) {
           const { done, value } = await reader.read();
@@ -3062,6 +3066,11 @@ Focus on the key sections and content, making it clean and modern.`;
             if (line.startsWith('data: ')) {
               try {
                 const data = JSON.parse(line.slice(6));
+                eventCount++;
+                // Log non-stream events for diagnostics
+                if (data.type !== 'stream') {
+                  console.log(`[clone] SSE event #${eventCount}: type=${data.type}`);
+                }
                 
                 if (data.type === 'status') {
                   setGenerationProgress(prev => ({ ...prev, status: data.message }));
@@ -3222,7 +3231,7 @@ Focus on the key sections and content, making it clean and modern.`;
           }
         }
         
-        console.log('[clone] Stream ended. generatedCode:', generatedCode?.length || 0, 'streamedAccum:', streamedCodeAccumulator?.length || 0);
+        console.log(`[clone] Stream ended. events=${eventCount}, generatedCode=${generatedCode?.length || 0}, streamedAccum=${streamedCodeAccumulator?.length || 0}`);
         
         setGenerationProgress(prev => ({
           ...prev,
